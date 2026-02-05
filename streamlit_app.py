@@ -1,127 +1,423 @@
-import streamlit as st
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Dict, List, Optional
+
 import pandas as pd
+import streamlit as st
 import folium
+from folium.features import GeoJsonTooltip
 from streamlit_folium import st_folium
 
-from core import load_geojson, load_csv, prepare_dataset, compute_isf_summary
+from core.normalize import safe_email
+from core.io import read_csv_any, validate_fieldforce, validate_weights
+from core.geo import extract_admin_index
+from core.scoring import compute_total_weight
+from core.project import Project, Territory
+from core.exports import build_allocations_table, summary_pivot, df_to_xlsx_bytes, save_map_html
 
-st.set_page_config(page_title="Territory Tool MVP", layout="wide")
+APP_TITLE = "Territory Allocation MVP (Pharma)"
+AUTH_CSV_PATH = Path("data/auth/licensed_users.csv")
 
-st.title("Territory Tool – MVP v0.1")
-st.caption("Upload → scegli LoB → mappa per ISF + tabella saturazione")
+st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-with st.sidebar:
-    st.header("Dati")
-    territories_file = st.file_uploader("territories.geojson", type=["geojson", "json"])
-    allocation_file = st.file_uploader("allocation.csv", type=["csv"])
-    isf_file = st.file_uploader("isf.csv", type=["csv"])
-    market_file = st.file_uploader("market.csv", type=["csv"])
+# -----------------------------
+# Auth
+# -----------------------------
+def load_auth_table() -> pd.DataFrame:
+    if not AUTH_CSV_PATH.exists():
+        return pd.DataFrame(columns=["email", "password", "active"])
+    df = pd.read_csv(AUTH_CSV_PATH)
+    for c in ["email", "password", "active"]:
+        if c not in df.columns:
+            df[c] = ""
+    df["email"] = df["email"].astype(str).str.lower().str.strip()
+    df["active"] = df["active"].astype(str).str.lower().isin(["true", "1", "yes", "y"])
+    return df
 
-    st.divider()
-    st.header("Parametri")
-    lob = st.text_input("LoB (es. VitD)", value="VitD")
-    target_mode = st.selectbox("Target per ISF", ["1/n (uguale)", "manuale (non implementato)"])
-    target_total = st.number_input("Sellout totale target (solo per 1/n)", min_value=0.0, value=0.0, step=1000.0)
+def check_login(email: str, password: str) -> bool:
+    df = load_auth_table()
+    email = safe_email(email)
+    match = df[(df["email"] == email) & (df["password"].astype(str) == str(password)) & (df["active"] == True)]
+    return len(match) > 0
 
-if not (territories_file and allocation_file and isf_file and market_file):
-    st.info("Carica i 4 file per iniziare (territories.geojson, allocation.csv, isf.csv, market.csv).")
+def ensure_session_defaults():
+    st.session_state.setdefault("logged_in", False)
+    st.session_state.setdefault("user_email", "")
+    st.session_state.setdefault("fieldforce_df", pd.DataFrame())
+    st.session_state.setdefault("weights_df", pd.DataFrame())
+    st.session_state.setdefault("admin_geojson", None)
+    st.session_state.setdefault("admin_by_id", {})
+    st.session_state.setdefault("project", Project(project_name="Romania MVP"))
+    st.session_state.setdefault("selected_admin_ids", [])
+    st.session_state.setdefault("map_center", [45.94, 24.97])  # Romania-ish center
+    st.session_state.setdefault("map_zoom", 6)
+    st.session_state.setdefault("last_clicked_admin_id", None)
+
+ensure_session_defaults()
+
+def login_ui():
+    st.title(APP_TITLE)
+    st.caption("Simple CSV-based license check. No roles, no DB.")
+    with st.form("login_form"):
+        email = st.text_input("Email", value=st.session_state.get("user_email", ""))
+        password = st.text_input("Password", type="password")
+        ok = st.form_submit_button("Login")
+    if ok:
+        if check_login(email, password):
+            st.session_state["logged_in"] = True
+            st.session_state["user_email"] = safe_email(email)
+            st.success("Logged in.")
+            st.rerun()
+        else:
+            st.error("Invalid credentials or inactive license.")
+
+if not st.session_state["logged_in"]:
+    login_ui()
     st.stop()
 
-try:
-    territories_gdf = load_geojson(territories_file)
-    allocation_df = load_csv(allocation_file)
-    isf_df = load_csv(isf_file)
-    market_df = load_csv(market_file)
-except Exception as e:
-    st.error(f"Errore nel caricamento: {e}")
-    st.stop()
-
-# LOB disponibili (se esiste la colonna)
-if "lob" in market_df.columns:
-    lobs = sorted([x for x in market_df["lob"].dropna().unique()])
-    if lobs:
-        lob = st.sidebar.selectbox("Seleziona LoB", lobs, index=min(lobs.index(lob), len(lobs)-1) if lob in lobs else 0)
-
-try:
-    gdf = prepare_dataset(territories_gdf, allocation_df, isf_df, market_df, lob=lob)
-except Exception as e:
-    st.error(f"Errore nella preparazione dataset: {e}")
-    st.stop()
-
-summary = compute_isf_summary(gdf)
-n_isf = max((summary["isf_id"].dropna().nunique() if "isf_id" in summary.columns else 0), 1)
-
-if target_mode.startswith("1/n") and target_total > 0:
-    target_per_isf = target_total / n_isf
-else:
-    # se non dato, usiamo il totale reale / n come riferimento
-    target_per_isf = gdf["sellout"].sum() / n_isf if n_isf else 0.0
-
-summary["target"] = target_per_isf
-summary["saturation"] = summary["sellout_total"] / summary["target"].replace(0, pd.NA)
-summary["saturation"] = summary["saturation"].fillna(0.0)
-
-# Layout
-col_map, col_tbl = st.columns([2, 1], gap="large")
-
-with col_tbl:
-    st.subheader("Saturazione per ISF")
-    st.dataframe(
-        summary[["isf_name", "sellout_total", "target", "saturation"]]
-        .rename(columns={"isf_name": "ISF", "sellout_total": "Sellout", "saturation": "Saturazione"})
-        .style.format({"Sellout": "{:,.0f}", "target": "{:,.0f}", "Saturazione": "{:.2f}"}),
-        use_container_width=True,
-        height=520,
+# -----------------------------
+# Header
+# -----------------------------
+st.title(APP_TITLE)
+colA, colB, colC = st.columns([2, 1, 1])
+with colA:
+    st.write(f"**User:** {st.session_state['user_email']}")
+with colB:
+    if st.button("Logout"):
+        st.session_state["logged_in"] = False
+        st.rerun()
+with colC:
+    st.download_button(
+        "Download fieldforce template",
+        data=Path("data/templates/fieldforce_template.csv").read_bytes() if Path("data/templates/fieldforce_template.csv").exists() else b"",
+        file_name="fieldforce_template.csv",
+        disabled=not Path("data/templates/fieldforce_template.csv").exists()
+    )
+    st.download_button(
+        "Download weights template",
+        data=Path("data/templates/weights_template.csv").read_bytes() if Path("data/templates/weights_template.csv").exists() else b"",
+        file_name="weights_template.csv",
+        disabled=not Path("data/templates/weights_template.csv").exists()
     )
 
-with col_map:
-    st.subheader("Mappa territori (colori per ISF)")
+st.divider()
 
-    # Centro mappa
-    try:
-        center = gdf.geometry.unary_union.centroid
-        m = folium.Map(location=[center.y, center.x], zoom_start=6, tiles="CartoDB positron")
-    except Exception:
-        m = folium.Map(location=[41.9, 12.5], zoom_start=5, tiles="CartoDB positron")
+# -----------------------------
+# Sidebar: project config + load/save
+# -----------------------------
+with st.sidebar:
+    st.header("Project")
+    st.session_state["project"].project_name = st.text_input("Project name", st.session_state["project"].project_name)
 
-    # palette semplice deterministica (senza dipendenze)
-    base_colors = [
-        "#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
-        "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf"
-    ]
-    isf_names = sorted(gdf["isf_name"].unique().tolist())
-    color_map = {name: base_colors[i % len(base_colors)] for i, name in enumerate(isf_names)}
+    country = st.selectbox("Country", ["Romania"], index=0)
+    level = st.selectbox("Territorial level", ["Judete+BucharestSectors"], index=0)
+    st.session_state["project"].country = country
+    st.session_state["project"].level = level
 
-    def style_fn(feature):
-        name = feature["properties"].get("isf_name", "UNASSIGNED")
-        return {
-            "fillColor": color_map.get(name, "#cccccc"),
-            "color": "#333333",
-            "weight": 1,
-            "fillOpacity": 0.55,
-        }
+    st.subheader("Save / Open")
+    save_name = st.text_input("Save filename", value="project_romania.json")
+    if st.button("Save project"):
+        st.session_state["project"].touch()
+        data = st.session_state["project"].to_json().encode("utf-8")
+        st.download_button("Download project JSON", data=data, file_name=save_name, mime="application/json")
+        st.info("Use the download button above to save the JSON locally.")
 
-    # aggiungi properties utili al geojson renderizzato
-    render_gdf = gdf.copy()
-    # Folium vuole json serializzabile: convertiamo alcune colonne
-    render_gdf["sellout"] = render_gdf["sellout"].astype(float)
-    render_gdf["territory_id"] = render_gdf["territory_id"].astype(str)
+    uploaded_project = st.file_uploader("Open project JSON", type=["json"])
+    if uploaded_project is not None:
+        try:
+            s = uploaded_project.read().decode("utf-8")
+            st.session_state["project"] = Project.from_json(s)
+            st.session_state["selected_admin_ids"] = []
+            st.success("Project loaded.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Could not load project: {e}")
 
-    folium.GeoJson(
-        data=render_gdf.to_json(),
-        name="territories",
-        style_function=style_fn,
-        tooltip=folium.GeoJsonTooltip(
-            fields=["territory_id", "isf_name", "sellout"],
-            aliases=["Territory", "ISF", "Sellout"],
-            localize=True
-        ),
-    ).add_to(m)
+# -----------------------------
+# Data loaders
+# -----------------------------
+st.subheader("1) Load data (CSV + GeoJSON)")
 
-    folium.LayerControl().add_to(m)
-    st_folium(m, use_container_width=True, height=560)
+c1, c2, c3 = st.columns(3)
+with c1:
+    up_weights = st.file_uploader("Weights CSV (territory_id, name, weight)", type=["csv"], key="weights_upl")
+with c2:
+    up_field = st.file_uploader("Fieldforce CSV (fieldforce.csv)", type=["csv"], key="field_upl")
+with c3:
+    up_geo = st.file_uploader("Admin GeoJSON (judete + sectors)", type=["geojson", "json"], key="geo_upl")
+
+issues = []
+
+if up_weights is not None:
+    wdf = read_csv_any(up_weights)
+    wdf, w_issues = validate_weights(wdf)
+    st.session_state["weights_df"] = wdf
+    if w_issues:
+        issues.append(f"Weights issues: {w_issues}")
+
+if up_field is not None:
+    fdf = read_csv_any(up_field)
+    fdf, f_issues = validate_fieldforce(fdf)
+    st.session_state["fieldforce_df"] = fdf
+    if f_issues:
+        issues.append(f"Fieldforce issues: {f_issues}")
+
+if up_geo is not None:
+    admin_geojson = json.loads(up_geo.read().decode("utf-8"))
+    st.session_state["admin_geojson"] = admin_geojson
+    by_id, norm_map = extract_admin_index(admin_geojson, id_prop="territory_id", name_prop="name")
+    st.session_state["admin_by_id"] = by_id
+
+if issues:
+    st.warning(" | ".join(issues))
+
+# Show loaded previews
+with st.expander("Loaded data preview"):
+    st.write("**Weights**")
+    st.dataframe(st.session_state["weights_df"].head(50), use_container_width=True)
+    st.write("**Fieldforce**")
+    st.dataframe(st.session_state["fieldforce_df"].head(50), use_container_width=True)
+    st.write("**GeoJSON loaded**:", st.session_state["admin_geojson"] is not None, "| Features:",
+             len((st.session_state["admin_geojson"] or {}).get("features", []) or []))
 
 st.divider()
-st.subheader("Download (dati di lavoro)")
-csv_out = gdf.drop(columns="geometry").to_csv(index=False).encode("utf-8")
-st.download_button("Scarica dataset unito (CSV)", data=csv_out, file_name="joined_dataset.csv", mime="text/csv")
+
+# -----------------------------
+# Helpers to build map
+# -----------------------------
+def make_map() -> folium.Map:
+    m = folium.Map(location=st.session_state["map_center"], zoom_start=st.session_state["map_zoom"], control_scale=True)
+
+    # Admin layer
+    if st.session_state["admin_geojson"] is not None:
+        selected = set(st.session_state["selected_admin_ids"])
+
+        def style_fn(feature):
+            props = feature.get("properties", {}) or {}
+            tid = str(props.get("territory_id", "")).strip()
+            is_sel = tid in selected
+            return {
+                "fillOpacity": 0.55 if is_sel else 0.20,
+                "weight": 2 if is_sel else 1,
+            }
+
+        folium.GeoJson(
+            st.session_state["admin_geojson"],
+            name="Admin units",
+            style_function=style_fn,
+            tooltip=GeoJsonTooltip(fields=["name", "territory_id"], aliases=["Name", "ID"], sticky=True),
+        ).add_to(m)
+
+    # Reps layer (pins)
+    fdf = st.session_state["fieldforce_df"]
+    if not fdf.empty and "Lat" in fdf.columns and "Long" in fdf.columns:
+        for _, r in fdf.iterrows():
+            if pd.isna(r.get("Lat")) or pd.isna(r.get("Long")):
+                continue
+            rep_name = f"{r.get('Name','')} {r.get('Surname','')}".strip()
+            uid = str(r.get("User_Id", "")).strip()
+            job = str(r.get("JobTitle", "")).strip()
+            bl = str(r.get("BusinessLine", "")).strip()
+            popup = f"<b>{rep_name}</b><br/>User_Id: {uid}<br/>{job}<br/>{bl}"
+            folium.CircleMarker(
+                location=[float(r["Lat"]), float(r["Long"])],
+                radius=5,
+                popup=folium.Popup(popup, max_width=300),
+            ).add_to(m)
+
+    folium.LayerControl().add_to(m)
+    return m
+
+def extract_clicked_admin_id(folium_return: dict) -> Optional[str]:
+    # streamlit-folium returns last_active_drawing/last_object_clicked etc depending on version.
+    # For GeoJson click, we can look for "last_object_clicked" with lat/lng only; not enough.
+    # But it also often includes "last_active_drawing" for Draw plugin (not used here).
+    # MVP approach: use a dropdown to select admin id after click is not reliable.
+    # So we provide a manual multiselect based on admin list AND allow "quick add" by typing.
+    return None
+
+# -----------------------------
+# Territory builder
+# -----------------------------
+st.subheader("2) Create / Edit commercial territories")
+
+left, right = st.columns([1.2, 1])
+
+with left:
+    st.write("### Map")
+    m = make_map()
+    folium_state = st_folium(m, width=None, height=650, returned_objects=[])
+
+with right:
+    st.write("### Territory editor")
+
+    admin_by_id: Dict[str, dict] = st.session_state["admin_by_id"]
+    weights_df = st.session_state["weights_df"]
+
+    # Admin units list (for selection)
+    admin_ids = list(admin_by_id.keys())
+    admin_labels = []
+    for tid in admin_ids:
+        props = (admin_by_id.get(tid, {}) or {}).get("properties", {}) or {}
+        name = str(props.get("name", tid))
+        admin_labels.append(f"{name} ({tid})")
+
+    label_to_id = {admin_labels[i]: admin_ids[i] for i in range(len(admin_ids))}
+
+    st.caption("MVP note: territory = group of admin units (judete/sectors). No mandatory fields.")
+    t_name = st.text_input("Commercial territory name", value="")
+
+    fdf = st.session_state["fieldforce_df"]
+    rep_options = []
+    am_options = []
+    if not fdf.empty and "User_Id" in fdf.columns:
+        # keep it simple: AM are those with JobTitle containing 'AM' (if any), otherwise same list
+        rep_options = sorted(set(fdf["User_Id"].astype(str).fillna("").tolist()))
+        am_options = sorted(set(fdf["User_Id"].astype(str).fillna("").tolist()))
+
+    rep_user = st.selectbox("Rep User_Id (optional)", options=[""] + rep_options)
+    am_user = st.selectbox("AM User_Id (optional)", options=[""] + am_options)
+
+    picked = st.multiselect(
+        "Select admin units",
+        options=admin_labels,
+        default=[lbl for lbl, tid in label_to_id.items() if tid in st.session_state["selected_admin_ids"]],
+    )
+    st.session_state["selected_admin_ids"] = [label_to_id[x] for x in picked]
+
+    total_w = compute_total_weight(st.session_state["selected_admin_ids"], weights_df)
+    st.metric("Current selected weight", f"{total_w:,.4f}")
+
+    if st.button("Add territory to project"):
+        terr = Territory(
+            territory_name=t_name,
+            rep_user_id=rep_user,
+            am_user_id=am_user,
+            admin_unit_ids=list(st.session_state["selected_admin_ids"]),
+        )
+        st.session_state["project"].territories.append(terr)
+        st.session_state["project"].touch()
+        st.session_state["selected_admin_ids"] = []
+        st.success("Territory added.")
+        st.rerun()
+
+    st.divider()
+
+    st.write("### Existing territories")
+    if not st.session_state["project"].territories:
+        st.info("No territories yet.")
+    else:
+        for i, terr in enumerate(st.session_state["project"].territories):
+            w = compute_total_weight(terr.admin_unit_ids, weights_df)
+            with st.expander(f"{i+1}. {terr.territory_name or '(no name)'}  |  weight={w:,.4f}  |  admin={len(terr.admin_unit_ids)}"):
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    new_name = st.text_input("Name", value=terr.territory_name, key=f"nm_{i}")
+                    new_rep = st.text_input("Rep User_Id", value=terr.rep_user_id, key=f"rp_{i}")
+                    new_am = st.text_input("AM User_Id", value=terr.am_user_id, key=f"am_{i}")
+                with c2:
+                    # edit admin units
+                    default_labels = []
+                    for tid in terr.admin_unit_ids:
+                        # reconstruct label
+                        props = (admin_by_id.get(tid, {}) or {}).get("properties", {}) or {}
+                        name = str(props.get("name", tid))
+                        lbl = f"{name} ({tid})"
+                        if lbl in label_to_id:
+                            default_labels.append(lbl)
+                    new_picked = st.multiselect(
+                        "Admin units",
+                        options=admin_labels,
+                        default=default_labels,
+                        key=f"au_{i}"
+                    )
+                    new_admin_ids = [label_to_id[x] for x in new_picked]
+
+                c3, c4 = st.columns([1, 1])
+                with c3:
+                    if st.button("Save changes", key=f"sv_{i}"):
+                        terr.territory_name = new_name
+                        terr.rep_user_id = new_rep
+                        terr.am_user_id = new_am
+                        terr.admin_unit_ids = new_admin_ids
+                        st.session_state["project"].touch()
+                        st.success("Saved.")
+                        st.rerun()
+                with c4:
+                    if st.button("Delete", key=f"del_{i}"):
+                        st.session_state["project"].territories.pop(i)
+                        st.session_state["project"].touch()
+                        st.warning("Deleted.")
+                        st.rerun()
+
+st.divider()
+
+# -----------------------------
+# Export
+# -----------------------------
+st.subheader("3) Export")
+
+weights_df = st.session_state["weights_df"]
+project = st.session_state["project"]
+
+# filters for allocation file dimension (business line + job title)
+bl = ""
+jt = ""
+fdf = st.session_state["fieldforce_df"]
+if not fdf.empty:
+    c1, c2 = st.columns(2)
+    with c1:
+        bl = st.selectbox("BusinessLine (for allocation output)", options=[""] + sorted(set(fdf["BusinessLine"].astype(str).fillna("").tolist())))
+    with c2:
+        jt = st.selectbox("JobTitle (for allocation output)", options=[""] + sorted(set(fdf["JobTitle"].astype(str).fillna("").tolist())))
+
+alloc_df = build_allocations_table(project, weights_df, business_line=bl, job_title=jt)
+sum_df = summary_pivot(project, weights_df)
+
+c1, c2, c3 = st.columns(3)
+
+with c1:
+    st.write("**Allocations preview**")
+    st.dataframe(alloc_df.head(100), use_container_width=True)
+
+with c2:
+    st.write("**Summary preview**")
+    st.dataframe(sum_df.head(100), use_container_width=True)
+
+with c3:
+    st.write("**Downloads**")
+    st.download_button(
+        "Download allocations CSV",
+        data=alloc_df.to_csv(index=False).encode("utf-8"),
+        file_name="allocations.csv",
+        mime="text/csv",
+        disabled=alloc_df.empty
+    )
+    st.download_button(
+        "Download summary CSV",
+        data=sum_df.to_csv(index=False).encode("utf-8"),
+        file_name="summary.csv",
+        mime="text/csv",
+        disabled=sum_df.empty
+    )
+    xlsx_bytes = df_to_xlsx_bytes({"Allocations": alloc_df, "Summary": sum_df})
+    st.download_button(
+        "Download XLSX",
+        data=xlsx_bytes,
+        file_name="exports.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disabled=(alloc_df.empty and sum_df.empty)
+    )
+
+# map HTML
+st.write("**Map HTML export** (includes admin units + rep pins)")
+m = make_map()
+html_bytes = save_map_html(m)
+st.download_button(
+    "Download map.html",
+    data=html_bytes,
+    file_name="map.html",
+    mime="text/html"
+)
