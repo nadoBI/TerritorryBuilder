@@ -56,6 +56,11 @@ def ensure_session_defaults():
     st.session_state.setdefault("logged_in", False)
     st.session_state.setdefault("user_email", "")
 
+    st.session_state.setdefault("selected_admin_ids", [])   # multi-select for builder
+    st.session_state.setdefault("last_popup_tid_builder", None)
+    st.session_state.setdefault("custom_territories", [])   # list[dict]
+
+
     # inputs
     st.session_state.setdefault("weights_df", pd.DataFrame())
     st.session_state.setdefault("reps_df", pd.DataFrame())
@@ -70,6 +75,9 @@ def ensure_session_defaults():
     st.session_state.setdefault("assign_df", pd.DataFrame())        # 1 row per base territory
     st.session_state.setdefault("rep_color_map", {})                # rep_id -> color
 
+
+
+    
     # UI state
     st.session_state.setdefault("selected_tid", "")                 # single selection
     st.session_state.setdefault("last_popup_tid", None)
@@ -688,6 +696,9 @@ else:
         st.dataframe(kpi_am, use_container_width=True, hide_index=True)
 
 st.divider()
+
+
+
 
 
 # ============================================================
