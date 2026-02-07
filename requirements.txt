@@ -4,3 +4,4 @@ geopandas
 shapely
 folium
 streamlit-folium
+openpyxl==3.1.5
