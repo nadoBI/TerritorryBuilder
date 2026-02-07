@@ -773,4 +773,3 @@ st.download_button(
     file_name="map.html",
     mime="text/html",
 )
-```
