@@ -167,27 +167,31 @@ with st.sidebar:
 # -----------------------------
 # Data loaders
 # -----------------------------
-st.subheader("1) Load data (CSV + GeoJSON)")
-##ATTENZIONE SECONDO ME QUI C'è roba doppia: c'è il vecchio file fieldforce che non serve più
-c1, c2, c3 = st.columns(3)
-with c1:
-    up_weights = st.file_uploader(
-        "Weights CSV (territory_id, name, weight)", type=["csv"], key="weights_upl"
-    )
-with c2:
-    up_field = st.file_uploader(
-        "Fieldforce CSV (fieldforce.csv)", type=["csv"], key="field_upl"
-    )
-with c3:
-    up_geo = st.file_uploader(
-        "Admin GeoJSON (judete + sectors)", type=["geojson", "json"], key="geo_upl"
-    )
+st.subheader("1) Load data (CSV)")
 
-up_reps = st.file_uploader("REPs CSV (User_Id, Name, Surname, Email)", type=["csv"], key="reps_upl")
-up_ams  = st.file_uploader("AMs CSV (User_Id, Name, Surname, Email)", type=["csv"], key="ams_upl")
-#Prima validazione
+# Download templates
+t1, t2, t3, t4 = st.columns(4)
+with t1:
+    st.download_button("Template REPs", data=Path("data/templates/reps_template.csv").read_bytes() if Path("data/templates/reps_template.csv").exists() else b"", file_name="reps_template.csv")
+with t2:
+    st.download_button("Template AMs", data=Path("data/templates/ams_template.csv").read_bytes() if Path("data/templates/ams_template.csv").exists() else b"", file_name="ams_template.csv")
+with t3:
+    st.download_button("Template Weights", data=Path("data/templates/weights_template.csv").read_bytes() if Path("data/templates/weights_template.csv").exists() else b"", file_name="weights_template.csv")
+with t4:
+    st.download_button("Template Assoc (optional)", data=Path("data/templates/assoc_template.csv").read_bytes() if Path("data/templates/assoc_template.csv").exists() else b"", file_name="assoc_template.csv")
+
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    up_weights = st.file_uploader("Weights CSV", type=["csv"], key="weights_upl")
+with c2:
+    up_reps = st.file_uploader("REPs CSV", type=["csv"], key="reps_upl")
+with c3:
+    up_ams = st.file_uploader("AMs CSV", type=["csv"], key="ams_upl")
+with c4:
+    up_assoc = st.file_uploader("Association CSV (optional)", type=["csv"], key="assoc_upl")
+
 def validate_people_df(df: pd.DataFrame, label: str) -> pd.DataFrame:
-    required = ["User_Id", "Name", "Surname", "Email"]
+    required = ["User_Id", "Name", "Surname", "Email", "Lat", "Long", "BusinessLine"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         st.error(f"{label}: missing columns {missing}")
@@ -195,14 +199,24 @@ def validate_people_df(df: pd.DataFrame, label: str) -> pd.DataFrame:
     df = df.copy()
     df["User_Id"] = df["User_Id"].astype(str).str.strip()
     df["Email"] = df["Email"].astype(str).str.strip().str.lower()
-    # drop empty ids
+    df["Lat"] = pd.to_numeric(df["Lat"], errors="coerce")
+    df["Long"] = pd.to_numeric(df["Long"], errors="coerce")
+    df["BusinessLine"] = df["BusinessLine"].astype(str).str.strip()
     df = df[df["User_Id"] != ""]
-    # unique check
     if df["User_Id"].duplicated().any():
         dups = df[df["User_Id"].duplicated()]["User_Id"].tolist()
         st.error(f"{label}: duplicated User_Id: {dups[:10]}")
         return pd.DataFrame()
     return df
+
+issues: List[str] = []
+
+if up_weights is not None:
+    wdf = read_csv_any(up_weights)
+    wdf, w_issues = validate_weights(wdf)
+    st.session_state["weights_df"] = wdf
+    if w_issues:
+        issues.append(f"Weights issues: {w_issues}")
 
 if up_reps is not None:
     reps = read_csv_any(up_reps)
@@ -214,49 +228,8 @@ if up_ams is not None:
     ams = validate_people_df(ams, "AMs")
     st.session_state["ams_df"] = ams
 
-#seconda (forse doppia?  o incorporabile prima?)
-reps["Lat"] = pd.to_numeric(reps["Lat"], errors="coerce")
-reps["Long"] = pd.to_numeric(reps["Long"], errors="coerce")
-
-issues: List[str] = []
-
-if up_weights is not None:
-    wdf = read_csv_any(up_weights)
-    wdf, w_issues = validate_weights(wdf)
-    st.session_state["weights_df"] = wdf
-    if w_issues:
-        issues.append(f"Weights issues: {w_issues}")
-
-if up_field is not None:
-    fdf = read_csv_any(up_field)
-    fdf, f_issues = validate_fieldforce(fdf)
-    st.session_state["fieldforce_df"] = fdf
-    if f_issues:
-        issues.append(f"Fieldforce issues: {f_issues}")
-
-if up_geo is not None:
-    admin_geojson = json.loads(up_geo.read().decode("utf-8"))
-    st.session_state["admin_geojson"] = admin_geojson
-    by_id, _ = extract_admin_index(admin_geojson, id_prop="territory_id", name_prop="name")
-    st.session_state["admin_by_id"] = by_id
-
 if issues:
     st.warning(" | ".join(issues))
-
-with st.expander("Loaded data preview"):
-    st.write("**Weights**")
-    st.dataframe(st.session_state["weights_df"].head(50), use_container_width=True)
-    st.write("**Fieldforce**")
-    st.dataframe(st.session_state["fieldforce_df"].head(50), use_container_width=True)
-    st.write(
-        "**GeoJSON loaded**:",
-        st.session_state["admin_geojson"] is not None,
-        "| Features:",
-        len((st.session_state["admin_geojson"] or {}).get("features", []) or []),
-    )
-
-st.divider()
-
 
 
 # -----------------------------
