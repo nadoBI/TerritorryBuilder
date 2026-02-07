@@ -21,7 +21,7 @@ APP_TITLE = "Territory Allocation MVP (Pharma)"
 AUTH_CSV_PATH = Path("data/auth/licensed_users.csv")
 
 # Put your fixed GeoJSON in Git here:
-ROM_GEO_PATH = Path("data/geo/Romania_Iqvia_sector&Judeti_0,012.geojson")
+ROM_GEO_PATH = Path("data/geo/Romania_Iqvia_sector&Judeti_0,013.geojson")
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
