@@ -57,11 +57,16 @@ def ensure_session_defaults():
     st.session_state.setdefault("weights_df", pd.DataFrame())
     st.session_state.setdefault("admin_geojson", None)
     st.session_state.setdefault("admin_by_id", {})
-    st.session_state.setdefault("project", Project(project_name="Romania MVP"))
+    st.session_state.setdefault("project", Project(project_name="Territory Sizing"))
     st.session_state.setdefault("selected_admin_ids", [])
     st.session_state.setdefault("map_center", [45.94, 24.97])
     st.session_state.setdefault("map_zoom", 6)
     st.session_state.setdefault("last_popup_tid", None)
+    st.session_state.setdefault("reps_df", pd.DataFrame())
+    st.session_state.setdefault("ams_df", pd.DataFrame())
+    st.session_state.setdefault("admin_units_df", pd.DataFrame())  # tab “territori base”
+    st.session_state.setdefault("active_rep", "")
+    st.session_state.setdefault("active_am", "")
 
 
 ensure_session_defaults()
@@ -163,7 +168,7 @@ with st.sidebar:
 # Data loaders
 # -----------------------------
 st.subheader("1) Load data (CSV + GeoJSON)")
-
+##ATTENZIONE SECONDO ME QUI C'è roba doppia: c'è il vecchio file fieldforce che non serve più
 c1, c2, c3 = st.columns(3)
 with c1:
     up_weights = st.file_uploader(
@@ -177,6 +182,41 @@ with c3:
     up_geo = st.file_uploader(
         "Admin GeoJSON (judete + sectors)", type=["geojson", "json"], key="geo_upl"
     )
+
+up_reps = st.file_uploader("REPs CSV (User_Id, Name, Surname, Email)", type=["csv"], key="reps_upl")
+up_ams  = st.file_uploader("AMs CSV (User_Id, Name, Surname, Email)", type=["csv"], key="ams_upl")
+#Prima validazione
+def validate_people_df(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    required = ["User_Id", "Name", "Surname", "Email"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        st.error(f"{label}: missing columns {missing}")
+        return pd.DataFrame()
+    df = df.copy()
+    df["User_Id"] = df["User_Id"].astype(str).str.strip()
+    df["Email"] = df["Email"].astype(str).str.strip().str.lower()
+    # drop empty ids
+    df = df[df["User_Id"] != ""]
+    # unique check
+    if df["User_Id"].duplicated().any():
+        dups = df[df["User_Id"].duplicated()]["User_Id"].tolist()
+        st.error(f"{label}: duplicated User_Id: {dups[:10]}")
+        return pd.DataFrame()
+    return df
+
+if up_reps is not None:
+    reps = read_csv_any(up_reps)
+    reps = validate_people_df(reps, "REPs")
+    st.session_state["reps_df"] = reps
+
+if up_ams is not None:
+    ams = read_csv_any(up_ams)
+    ams = validate_people_df(ams, "AMs")
+    st.session_state["ams_df"] = ams
+
+#seconda (forse doppia?  o incorporabile prima?)
+reps["Lat"] = pd.to_numeric(reps["Lat"], errors="coerce")
+reps["Long"] = pd.to_numeric(reps["Long"], errors="coerce")
 
 issues: List[str] = []
 
@@ -216,6 +256,49 @@ with st.expander("Loaded data preview"):
     )
 
 st.divider()
+
+
+
+# -----------------------------
+# Tabella ADMIN UNIT 
+# -----------------------------
+
+def build_admin_units_df(admin_by_id: Dict[str, dict], weights_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for tid, feat in admin_by_id.items():
+        props = (feat or {}).get("properties", {}) or {}
+        name = str(props.get("name", tid))
+        rows.append({"territory_id": str(tid), "name": name})
+    df = pd.DataFrame(rows)
+
+    w = weights_df.copy()
+    w["territory_id"] = w["territory_id"].astype(str).str.strip()
+    w["weight"] = pd.to_numeric(w["weight"], errors="coerce").fillna(0.0)
+
+    df = df.merge(w[["territory_id", "weight"]], on="territory_id", how="left")
+    df["weight"] = df["weight"].fillna(0.0)
+
+    # assignment columns
+    df["rep_user_id"] = ""
+    df["am_user_id"] = ""
+    df["bu"] = ""
+
+    return df
+
+# dopo aver caricato geojson + weights:
+if (
+    st.session_state["admin_by_id"]
+    and not st.session_state["weights_df"].empty
+    and st.session_state["admin_units_df"].empty
+):
+    st.session_state["admin_units_df"] = build_admin_units_df(
+        st.session_state["admin_by_id"], st.session_state["weights_df"]
+    )
+
+
+
+
+
 
 # -----------------------------
 # Helpers to build map
