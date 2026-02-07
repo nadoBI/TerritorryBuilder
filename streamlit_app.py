@@ -7,7 +7,8 @@ from typing import Dict, List, Optional
 import pandas as pd
 import streamlit as st
 import folium
-from folium.features import GeoJsonTooltip
+import re
+from folium.features import GeoJsonTooltip, GeoJsonPopup
 from streamlit_folium import st_folium
 
 from core.normalize import safe_email
@@ -187,8 +188,14 @@ st.divider()
 # -----------------------------
 # Helpers to build map
 # -----------------------------
+#CHACHE MAPPA BASE
+@st.cache_data(show_spinner=False)
+def cached_admin_geojson(admin_geojson: dict) -> dict:
+    return admin_geojson
+
 def make_map() -> folium.Map:
     m = folium.Map(location=st.session_state["map_center"], zoom_start=st.session_state["map_zoom"], control_scale=True)
+    admin_geojson = cached_admin_geojson(st.session_state["admin_geojson"])
 
     # Admin layer
     if st.session_state["admin_geojson"] is not None:
@@ -202,13 +209,14 @@ def make_map() -> folium.Map:
                 "fillOpacity": 0.55 if is_sel else 0.20,
                 "weight": 2 if is_sel else 1,
             }
-
-        folium.GeoJson(
-            st.session_state["admin_geojson"],
-            name="Admin units",
-            style_function=style_fn,
-            tooltip=GeoJsonTooltip(fields=["name", "territory_id"], aliases=["Name", "ID"], sticky=True),
-        ).add_to(m)
+# fa mappa e popup
+folium.GeoJson(
+    st.session_state["admin_geojson"],
+    name="Admin units",
+    style_function=style_fn,  # puoi anche renderla fissa per performance, vedi fix C
+    tooltip=GeoJsonTooltip(fields=["name", "territory_id"], aliases=["Name", "ID"], sticky=True),
+    popup=GeoJsonPopup(fields=["territory_id"], aliases=["ID"], labels=True),
+).add_to(m)
 
     # Reps layer (pins)
     fdf = st.session_state["fieldforce_df"]
@@ -248,7 +256,23 @@ left, right = st.columns([1.2, 1])
 with left:
     st.write("### Map")
     m = make_map()
-    folium_state = st_folium(m, width=None, height=650, returned_objects=[])
+    folium_state = st_folium(m, width=None, height=650, returned_objects=["last_object_clicked_popup"])
+popup = folium_state.get("last_object_clicked_popup")
+
+if popup:
+    # popup contiene HTML; estrai il primo token "id-like"
+    m_id = re.search(r"([A-Za-z0-9_\-]+)", str(popup))
+    if m_id:
+        tid = m_id.group(1)
+
+        sel = st.session_state.get("selected_admin_ids", [])
+        if tid in sel:
+            sel.remove(tid)
+        else:
+            sel.append(tid)
+
+        st.session_state["selected_admin_ids"] = sel
+        st.rerun()
 
 with right:
     st.write("### Territory editor")
