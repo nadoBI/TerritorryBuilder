@@ -15,20 +15,20 @@ from streamlit_folium import st_folium
 from core.normalize import safe_email
 from core.io import read_csv_any, validate_weights
 from core.geo import extract_admin_index
-from core.exports import df_to_xlsx_bytes, save_map_html  # if openpyxl missing, XLSX will be disabled
+from core.exports import df_to_xlsx_bytes, save_map_html  # XLSX may fail if openpyxl missing
 
 APP_TITLE = "Territory Allocation MVP (Pharma)"
 AUTH_CSV_PATH = Path("data/auth/licensed_users.csv")
 
-# Put your fixed GeoJSON in Git here:
-ROM_GEO_PATH = Path("data/geo/Romania_Iqvia_sector&Judeti_0,013.geojson")
+# GeoJSON stored in repo
+ROM_GEO_PATH = Path("data/geo/Romania_Iqvia_sector&Judeti_0,012.geojson")
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 
-# -----------------------------
+# ============================================================
 # Auth
-# -----------------------------
+# ============================================================
 def load_auth_table() -> pd.DataFrame:
     if not AUTH_CSV_PATH.exists():
         return pd.DataFrame(columns=["email", "password", "active"])
@@ -52,34 +52,29 @@ def check_login(email: str, password: str) -> bool:
     return len(match) > 0
 
 
-# -----------------------------
-# Session defaults
-# -----------------------------
 def ensure_session_defaults():
     st.session_state.setdefault("logged_in", False)
     st.session_state.setdefault("user_email", "")
 
-    # Inputs
+    # inputs
     st.session_state.setdefault("weights_df", pd.DataFrame())
     st.session_state.setdefault("reps_df", pd.DataFrame())
     st.session_state.setdefault("ams_df", pd.DataFrame())
 
-    # Geo / admin base
+    # geo/admin
     st.session_state.setdefault("admin_geojson", None)
     st.session_state.setdefault("admin_by_id", {})          # territory_id -> feature
-    st.session_state.setdefault("admin_units_df", pd.DataFrame())  # base admin units + weight
+    st.session_state.setdefault("admin_units_df", pd.DataFrame())  # territory_id, territory_name, weight
 
-    # Assignment master table (truth)
-    st.session_state.setdefault("assign_df", pd.DataFrame())  # 1 row per admin unit: rep/am assignments
+    # assignments (truth)
+    st.session_state.setdefault("assign_df", pd.DataFrame())        # 1 row per base territory
+    st.session_state.setdefault("rep_color_map", {})                # rep_id -> color
 
     # UI state
-    st.session_state.setdefault("selected_admin_ids", [])
+    st.session_state.setdefault("selected_tid", "")                 # single selection
     st.session_state.setdefault("last_popup_tid", None)
     st.session_state.setdefault("map_center", [45.94, 24.97])
     st.session_state.setdefault("map_zoom", 6)
-
-    # Colors per REP
-    st.session_state.setdefault("rep_color_map", {})
 
 
 ensure_session_defaults()
@@ -107,9 +102,9 @@ if not st.session_state["logged_in"]:
     st.stop()
 
 
-# -----------------------------
-# Helpers (people + assignments)
-# -----------------------------
+# ============================================================
+# Helpers
+# ============================================================
 def _full_name(df: pd.DataFrame) -> pd.Series:
     return (
         df["Name"].astype(str).fillna("").str.strip()
@@ -137,7 +132,6 @@ def validate_people_df(df: pd.DataFrame, label: str) -> pd.DataFrame:
         dups = df[df["User_Id"].duplicated()]["User_Id"].tolist()
         st.error(f"{label}: duplicated User_Id: {dups[:10]}")
         return pd.DataFrame()
-
     return df
 
 
@@ -149,15 +143,14 @@ def build_color_map_for_reps(reps_df: pd.DataFrame) -> Dict[str, str]:
 
 
 def build_admin_units_df(admin_by_id: Dict[str, dict], weights_df: pd.DataFrame) -> pd.DataFrame:
-    # base admin units list (from GeoJSON)
     rows = []
     for tid, feat in admin_by_id.items():
         props = (feat or {}).get("properties", {}) or {}
-        name = str(props.get("name", tid))
-        rows.append({"territory_id": str(tid).strip(), "territory_name": name.strip()})
+        name = str(props.get("name", tid)).strip()
+        rows.append({"territory_id": str(tid).strip(), "territory_name": name})
+
     df = pd.DataFrame(rows)
 
-    # merge weights
     w = weights_df.copy()
     w["territory_id"] = w["territory_id"].astype(str).str.strip()
     w["weight"] = pd.to_numeric(w["weight"], errors="coerce").fillna(0.0)
@@ -177,7 +170,7 @@ def build_assign_df(admin_units_df: pd.DataFrame, reps_df: pd.DataFrame, ams_df:
         if c not in df.columns:
             df[c] = ""
 
-    # names from lookups
+    # name lookups
     if not reps_df.empty:
         r = reps_df.copy()
         r["User_Id"] = r["User_Id"].astype(str).str.strip()
@@ -199,21 +192,24 @@ def build_assign_df(admin_units_df: pd.DataFrame, reps_df: pd.DataFrame, ams_df:
 def apply_assoc_to_assign(assign_df: pd.DataFrame, assoc_df: pd.DataFrame) -> pd.DataFrame:
     df = assign_df.copy()
     a = assoc_df.copy()
+
+    # expected columns: territory_id, rep_id, am_id (am_id optional)
     for c in ["territory_id", "rep_id", "am_id"]:
         if c in a.columns:
             a[c] = a[c].astype(str).str.strip()
 
-    if "territory_id" not in a.columns:
-        st.error("Association CSV must contain territory_id")
+    if "territory_id" not in a.columns or "rep_id" not in a.columns:
+        st.error("Association CSV must contain at least: territory_id, rep_id (am_id optional)")
         return df
 
-    cols = ["territory_id"] + [c for c in ["rep_id", "am_id"] if c in a.columns]
-    a = a[cols].drop_duplicates(subset=["territory_id"])
+    a = a.drop_duplicates(subset=["territory_id"])
 
-    tmp = df.merge(a, on="territory_id", how="left", suffixes=("", "_new"))
-    if "rep_id_new" in tmp.columns:
-        tmp["rep_id"] = tmp["rep_id_new"].fillna(tmp["rep_id"])
-        tmp.drop(columns=["rep_id_new"], inplace=True)
+    tmp = df.merge(a[["territory_id", "rep_id"] + (["am_id"] if "am_id" in a.columns else [])],
+                   on="territory_id", how="left", suffixes=("", "_new"))
+
+    tmp["rep_id"] = tmp["rep_id_new"].fillna(tmp["rep_id"])
+    tmp.drop(columns=["rep_id_new"], inplace=True)
+
     if "am_id_new" in tmp.columns:
         tmp["am_id"] = tmp["am_id_new"].fillna(tmp["am_id"])
         tmp.drop(columns=["am_id_new"], inplace=True)
@@ -231,18 +227,21 @@ def _parse_tid_from_popup(popup_html: str) -> Optional[str]:
     return m2.group(1) if m2 else None
 
 
-# -----------------------------
-# Load fixed GeoJSON from repo
-# -----------------------------
-if st.session_state["admin_geojson"] is None and ROM_GEO_PATH.exists():
-    st.session_state["admin_geojson"] = json.loads(ROM_GEO_PATH.read_text(encoding="utf-8"))
-    by_id, _ = extract_admin_index(st.session_state["admin_geojson"], id_prop="territory_id", name_prop="name")
-    st.session_state["admin_by_id"] = by_id
+# ============================================================
+# Load fixed GeoJSON (repo)
+# ============================================================
+if st.session_state["admin_geojson"] is None:
+    if ROM_GEO_PATH.exists():
+        st.session_state["admin_geojson"] = json.loads(ROM_GEO_PATH.read_text(encoding="utf-8"))
+        by_id, _ = extract_admin_index(st.session_state["admin_geojson"], id_prop="territory_id", name_prop="name")
+        st.session_state["admin_by_id"] = by_id
+    else:
+        st.error(f"Missing GeoJSON in repo: {ROM_GEO_PATH.as_posix()}")
 
 
-# -----------------------------
+# ============================================================
 # Header
-# -----------------------------
+# ============================================================
 st.title(APP_TITLE)
 colA, colB, colC = st.columns([2, 1, 1])
 with colA:
@@ -252,23 +251,17 @@ with colB:
         st.session_state["logged_in"] = False
         st.rerun()
 with colC:
-    st.caption("GeoJSON is fixed in repo (no upload).")
+    st.caption("GeoJSON fixed in repo (no upload).")
 
 st.divider()
 
 
-# -----------------------------
-# Sidebar: Save / Open project JSON (new format)
-# -----------------------------
+# ============================================================
+# Sidebar: Save/Open project JSON (new format)
+# ============================================================
 def export_project_json() -> bytes:
     payload = {
-        "meta": {
-            "app": APP_TITLE,
-            "country": "Romania",
-            "level": "Judete+BucharestSectors",
-        },
-        "reps": st.session_state["reps_df"].to_dict(orient="records"),
-        "ams": st.session_state["ams_df"].to_dict(orient="records"),
+        "meta": {"app": APP_TITLE, "country": "Romania", "level": "Judete+BucharestSectors"},
         "rep_color_map": st.session_state["rep_color_map"],
         "assignments": st.session_state["assign_df"].to_dict(orient="records"),
     }
@@ -277,28 +270,21 @@ def export_project_json() -> bytes:
 
 def load_project_json(s: str) -> None:
     obj = json.loads(s)
-
-    reps = pd.DataFrame(obj.get("reps", []))
-    ams = pd.DataFrame(obj.get("ams", []))
+    rep_color_map = obj.get("rep_color_map", {}) or {}
     assign = pd.DataFrame(obj.get("assignments", []))
 
-    st.session_state["reps_df"] = reps if not reps.empty else pd.DataFrame()
-    st.session_state["ams_df"] = ams if not ams.empty else pd.DataFrame()
-    st.session_state["rep_color_map"] = obj.get("rep_color_map", {}) or {}
+    st.session_state["rep_color_map"] = rep_color_map
 
-    # rebuild assign_df safely using current admin_units_df (territory list)
-    if not st.session_state["admin_units_df"].empty and not assign.empty:
-        # keep only relevant columns
-        cols = ["territory_id", "rep_id", "am_id"]
-        keep = [c for c in cols if c in assign.columns]
-        assoc = assign[keep].copy()
+    # rebuild from current base territories
+    if not st.session_state["admin_units_df"].empty:
         base = build_assign_df(st.session_state["admin_units_df"], st.session_state["reps_df"], st.session_state["ams_df"])
-        base = apply_assoc_to_assign(base, assoc.rename(columns={"rep_id": "rep_id", "am_id": "am_id"}))
+        if not assign.empty and "territory_id" in assign.columns:
+            # keep only these cols
+            cols = [c for c in ["territory_id", "rep_id", "am_id"] if c in assign.columns]
+            base = apply_assoc_to_assign(base, assign[cols].copy())
         st.session_state["assign_df"] = build_assign_df(base, st.session_state["reps_df"], st.session_state["ams_df"])
-    else:
-        st.session_state["assign_df"] = build_assign_df(st.session_state["admin_units_df"], st.session_state["reps_df"], st.session_state["ams_df"])
 
-    st.session_state["selected_admin_ids"] = []
+    st.session_state["selected_tid"] = ""
     st.session_state["last_popup_tid"] = None
 
 
@@ -324,12 +310,11 @@ with st.sidebar:
             st.error(f"Could not load project: {e}")
 
 
-# -----------------------------
+# ============================================================
 # Data loaders
-# -----------------------------
+# ============================================================
 st.subheader("1) Load data (CSV)")
 
-# Download templates
 t1, t2, t3, t4 = st.columns(4)
 with t1:
     st.download_button(
@@ -391,23 +376,20 @@ if issues:
     st.warning(" | ".join(issues))
 
 
-# -----------------------------
-# Build base admin_units_df and assign_df
-# -----------------------------
+# Build admin_units_df once weights are loaded
 if st.session_state["admin_units_df"].empty and st.session_state["admin_by_id"] and not st.session_state["weights_df"].empty:
     st.session_state["admin_units_df"] = build_admin_units_df(st.session_state["admin_by_id"], st.session_state["weights_df"])
 
-# initialize assign_df if possible
+# Init assign_df once base territories exist
 if not st.session_state["admin_units_df"].empty and st.session_state["assign_df"].empty:
     st.session_state["assign_df"] = build_assign_df(st.session_state["admin_units_df"], st.session_state["reps_df"], st.session_state["ams_df"])
 
-# apply association if uploaded (requires assign_df exists)
+# Apply assoc if uploaded
 if up_assoc is not None and not st.session_state["assign_df"].empty:
     assoc = read_csv_any(up_assoc)
     st.session_state["assign_df"] = apply_assoc_to_assign(st.session_state["assign_df"], assoc)
     st.session_state["assign_df"] = build_assign_df(st.session_state["assign_df"], st.session_state["reps_df"], st.session_state["ams_df"])
-    st.success("Associations applied to assignment table.")
-
+    st.success("Associations applied.")
 
 with st.expander("Loaded data preview"):
     st.write("**Weights**")
@@ -416,35 +398,31 @@ with st.expander("Loaded data preview"):
     st.dataframe(st.session_state["reps_df"].head(50), use_container_width=True)
     st.write("**AMs**")
     st.dataframe(st.session_state["ams_df"].head(50), use_container_width=True)
-    st.write("**Admin units**:", len(st.session_state["admin_units_df"]))
-    st.write("**Assignments**:", len(st.session_state["assign_df"]))
-
+    st.write("**Base territories**:", len(st.session_state["admin_units_df"]))
+    st.write("**Assignments rows**:", len(st.session_state["assign_df"]))
 
 st.divider()
 
 
-# -----------------------------
-# Map
-# -----------------------------
+# ============================================================
+# Map (layers)
+# ============================================================
 @st.cache_data(show_spinner=False)
 def cached_admin_geojson(admin_geojson: dict) -> dict:
     return admin_geojson
 
 
-def _icon_html(color: str, kind: str) -> str:
-    # small dot marker; different shape by kind using border
-    border = "2px solid #000000" if kind == "REP" else "2px dashed #000000"
-    return f"""
-    <div style="
-        width:12px;height:12px;border-radius:50%;
-        background:{color};
-        border:{border};
-        opacity:0.9;">
-    </div>
-    """
+def _pin_div_icon(kind: str) -> folium.DivIcon:
+    # simple dot; different border style by kind
+    # no names, no tooltip text with names (per your requirement)
+    if kind == "REP":
+        html = "<div style='width:10px;height:10px;border-radius:50%;background:#ff7f0e;border:2px solid #000;opacity:0.9;'></div>"
+    else:
+        html = "<div style='width:10px;height:10px;border-radius:50%;background:#1f77b4;border:2px dashed #000;opacity:0.9;'></div>"
+    return folium.DivIcon(html=html)
 
 
-def make_map(show_admin_layer: bool = True, show_assigned_colors: bool = True) -> folium.Map:
+def make_map() -> folium.Map:
     m = folium.Map(
         location=st.session_state["map_center"],
         zoom_start=st.session_state["map_zoom"],
@@ -460,7 +438,9 @@ def make_map(show_admin_layer: bool = True, show_assigned_colors: bool = True) -
     assign_df = st.session_state["assign_df"]
     rep_color_map = st.session_state["rep_color_map"] or {}
 
-    # Build territory_id -> rep_id and -> color
+    selected_tid = str(st.session_state.get("selected_tid", "")).strip()
+
+    # territory_id -> rep_id/color
     tid_to_rep: Dict[str, str] = {}
     tid_to_color: Dict[str, str] = {}
     if not assign_df.empty:
@@ -472,90 +452,84 @@ def make_map(show_admin_layer: bool = True, show_assigned_colors: bool = True) -
                 if rid and rid in rep_color_map:
                     tid_to_color[tid] = rep_color_map[rid]
 
-    selected_now = set(st.session_state.get("selected_admin_ids", []))
+    # --- Layer 1: Base admin boundaries (neutral)
+    base_admin_layer = folium.FeatureGroup(name="Admin (boundaries + labels)", show=True)
 
-    def style_fn(feature):
+    def style_base(_feature):
+        return {"fillColor": "#cccccc", "color": "#999999", "fillOpacity": 0.06, "weight": 1}
+
+    folium.GeoJson(
+        admin_geojson,
+        name="Admin base",
+        style_function=style_base,
+        tooltip=GeoJsonTooltip(fields=["name", "territory_id"], aliases=["Name", "ID"], sticky=True),
+        popup=GeoJsonPopup(fields=["territory_id"], aliases=["ID"], labels=True),
+    ).add_to(base_admin_layer)
+
+    base_admin_layer.add_to(m)
+
+    # --- Layer 2: Overlay colored by REP assignment
+    colored_layer = folium.FeatureGroup(name="Assignments (colored by REP)", show=True)
+
+    def style_colored(feature):
         props = feature.get("properties", {}) or {}
         tid = str(props.get("territory_id", "")).strip()
 
-        fill_color = "#cccccc"
-        fill_opacity = 0.10
-        weight = 1
+        fill_color = tid_to_color.get(tid, "#cccccc")
+        fill_opacity = 0.22 if tid in tid_to_color else 0.05
+        weight = 2 if tid == selected_tid else 1
+        color = "#000000" if tid == selected_tid else fill_color
 
-        if show_assigned_colors and tid in tid_to_color:
-            fill_color = tid_to_color[tid]
-            fill_opacity = 0.22
+        return {"fillColor": fill_color, "color": color, "fillOpacity": fill_opacity, "weight": weight}
 
-        if tid in selected_now:
-            fill_color = "#000000"
-            fill_opacity = 0.45
-            weight = 2
-
-        return {
-            "fillColor": fill_color,
-            "color": fill_color,
-            "fillOpacity": fill_opacity,
-            "weight": weight,
-        }
-
-    admin_layer = folium.FeatureGroup(name="Admin units", show=show_admin_layer)
     folium.GeoJson(
         admin_geojson,
-        name="Admin units",
-        style_function=style_fn,
+        name="Assignments",
+        style_function=style_colored,
         tooltip=GeoJsonTooltip(fields=["name", "territory_id"], aliases=["Name", "ID"], sticky=True),
         popup=GeoJsonPopup(fields=["territory_id"], aliases=["ID"], labels=True),
-    ).add_to(admin_layer)
-    admin_layer.add_to(m)
+    ).add_to(colored_layer)
 
-    # People layers
-    rep_layer = folium.FeatureGroup(name="REPs", show=True)
-    am_layer = folium.FeatureGroup(name="AMs", show=False)
+    colored_layer.add_to(m)
 
-    def add_people(df: pd.DataFrame, layer: folium.FeatureGroup, kind: str):
-        if df.empty:
-            return
-        for _, r in df.iterrows():
+    # --- Layer 3: REP pins (no names)
+    rep_layer = folium.FeatureGroup(name="REP pins", show=True)
+    reps_df = st.session_state["reps_df"]
+    if not reps_df.empty:
+        for _, r in reps_df.iterrows():
             lat, lon = r.get("Lat"), r.get("Long")
             if pd.isna(lat) or pd.isna(lon):
                 continue
-
-            uid = str(r.get("User_Id", "")).strip()
-            nm = f"{r.get('Name','')} {r.get('Surname','')}".strip()
-            bl = str(r.get("BusinessLine", "")).strip()
-            prov = str(r.get("Province", "")).strip()
-
-            tooltip = f"{kind}: {nm} | {bl} | {prov}"
-            popup_html = (
-                f"<b>{kind}: {nm}</b><br/>"
-                f"User_Id: {uid}<br/>"
-                f"BusinessLine: {bl}<br/>"
-                f"Province: {prov}<br/>"
-                f"Region: {str(r.get('Region','')).strip()}<br/>"
-                f"Address: {str(r.get('Address','')).strip()}"
-            )
-
-            color = "#1f77b4" if kind == "AM" else rep_color_map.get(uid, "#ff7f0e")
+            # no names in tooltip/popup
             folium.Marker(
                 location=[float(lat), float(lon)],
-                icon=folium.DivIcon(html=_icon_html(color, kind)),
-                tooltip=tooltip,
-                popup=folium.Popup(popup_html, max_width=320),
-            ).add_to(layer)
-
-    add_people(st.session_state["reps_df"], rep_layer, "REP")
-    add_people(st.session_state["ams_df"], am_layer, "AM")
+                icon=_pin_div_icon("REP"),
+            ).add_to(rep_layer)
 
     rep_layer.add_to(m)
+
+    # --- Layer 4: AM pins (no names)
+    am_layer = folium.FeatureGroup(name="AM pins", show=False)
+    ams_df = st.session_state["ams_df"]
+    if not ams_df.empty:
+        for _, r in ams_df.iterrows():
+            lat, lon = r.get("Lat"), r.get("Long")
+            if pd.isna(lat) or pd.isna(lon):
+                continue
+            folium.Marker(
+                location=[float(lat), float(lon)],
+                icon=_pin_div_icon("AM"),
+            ).add_to(am_layer)
+
     am_layer.add_to(m)
 
     folium.LayerControl().add_to(m)
     return m
 
 
-# -----------------------------
-# Assignment UI
-# -----------------------------
+# ============================================================
+# Assignment UI (Map + tables)
+# ============================================================
 st.subheader("2) Assign territories (REP / AM)")
 
 if st.session_state["assign_df"].empty:
@@ -563,77 +537,101 @@ if st.session_state["assign_df"].empty:
 else:
     left, right = st.columns([1.2, 1])
 
-    # --- LEFT: Map
+    # LEFT: Map + click selection
     with left:
         st.write("### Map")
-        m = make_map(show_admin_layer=True, show_assigned_colors=True)
+        m = make_map()
         folium_state = st_folium(m, width=None, height=650, returned_objects=["last_object_clicked_popup"])
+
         popup = folium_state.get("last_object_clicked_popup")
         if popup:
             tid = _parse_tid_from_popup(str(popup))
             if tid and st.session_state.get("last_popup_tid") != tid:
                 st.session_state["last_popup_tid"] = tid
-                st.session_state["selected_admin_ids"] = [tid]  # single selection
+                st.session_state["selected_tid"] = tid
                 st.rerun()
 
-    # --- RIGHT: Tables / assignment
+    # RIGHT: Tables / assign
     with right:
-        st.write("### Assignment table")
+        st.write("### Tables / assignment")
+
         assign_df = st.session_state["assign_df"]
         reps_df = st.session_state["reps_df"]
         ams_df = st.session_state["ams_df"]
 
-        selected_tid = (st.session_state.get("selected_admin_ids") or [None])[0]
+        selected_tid = str(st.session_state.get("selected_tid", "")).strip()
         if selected_tid:
-            row = assign_df[assign_df["territory_id"] == str(selected_tid)]
+            row = assign_df[assign_df["territory_id"] == selected_tid]
             if not row.empty:
                 tn = row.iloc[0]["territory_name"]
                 tw = float(row.iloc[0]["weight"])
-                st.caption(f"Selected: **{tn}** ({tw:.2f})")
+                st.caption(f"Selected territory: **{tn}** ({tw:.2f}) | id={selected_tid}")
 
+        # small tables (reps + territories)
+        with st.expander("REPs table"):
+            if reps_df.empty:
+                st.info("No REPs loaded.")
+            else:
+                reps_view = reps_df.copy()
+                reps_view["NameFull"] = _full_name(reps_view)
+                st.dataframe(reps_view[["User_Id", "NameFull", "BusinessLine", "Lat", "Long"]], use_container_width=True)
+
+        with st.expander("Territories table"):
+            base = st.session_state["admin_units_df"]
+            if base.empty:
+                st.info("Load weights first.")
+            else:
+                base_view = base.copy()
+                base_view["territory"] = base_view["territory_name"] + " (" + base_view["weight"].map(lambda x: f"{float(x):.2f}") + ")"
+                st.dataframe(base_view[["territory_id", "territory"]], use_container_width=True)
+
+        # pick active rep/am (names shown here; map pins are anonymous)
         rep_options = [""] + (
             (reps_df["User_Id"].astype(str).str.strip() + " - " + _full_name(reps_df)).tolist()
-            if not reps_df.empty
-            else []
+            if not reps_df.empty else []
         )
         am_options = [""] + (
             (ams_df["User_Id"].astype(str).str.strip() + " - " + _full_name(ams_df)).tolist()
-            if not ams_df.empty
-            else []
+            if not ams_df.empty else []
         )
 
-        active_rep = st.selectbox("Active REP", rep_options)
-        active_am = st.selectbox("Active AM", am_options)
+        active_rep = st.selectbox("Active REP (for assignment)", rep_options)
+        active_am = st.selectbox("Active AM (for assignment)", am_options)
         rep_id = active_rep.split(" - ")[0] if active_rep else ""
         am_id = active_am.split(" - ")[0] if active_am else ""
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         with c1:
             if st.button("Assign selected -> REP", disabled=(not selected_tid or not rep_id)):
                 df = st.session_state["assign_df"].copy()
-                mask = df["territory_id"] == str(selected_tid)
+                mask = df["territory_id"] == selected_tid
                 df.loc[mask, "rep_id"] = rep_id
                 st.session_state["assign_df"] = build_assign_df(df, reps_df, ams_df)
                 st.rerun()
         with c2:
             if st.button("Assign selected -> AM", disabled=(not selected_tid or not am_id)):
                 df = st.session_state["assign_df"].copy()
-                mask = df["territory_id"] == str(selected_tid)
+                mask = df["territory_id"] == selected_tid
                 df.loc[mask, "am_id"] = am_id
                 st.session_state["assign_df"] = build_assign_df(df, reps_df, ams_df)
                 st.rerun()
         with c3:
             if st.button("Clear selected", disabled=(not selected_tid)):
                 df = st.session_state["assign_df"].copy()
-                mask = df["territory_id"] == str(selected_tid)
+                mask = df["territory_id"] == selected_tid
                 df.loc[mask, ["rep_id", "rep_name", "am_id", "am_name"]] = ""
                 st.session_state["assign_df"] = build_assign_df(df, reps_df, ams_df)
+                st.rerun()
+        with c4:
+            if st.button("Clear selection", disabled=(not selected_tid)):
+                st.session_state["selected_tid"] = ""
+                st.session_state["last_popup_tid"] = None
                 st.rerun()
 
         st.divider()
 
-        st.caption("Bulk edit (MVP replacement of drag&drop): edit REP/AM IDs in table, then Apply.")
-
+        # Drag&drop MVP = data editor (bulk edit)
+        st.caption("Bulk edit (MVP replacement of drag&drop): edit REP/AM Ids and Apply.")
         view_df = st.session_state["assign_df"].copy()
         view_df["territory"] = view_df["territory_name"] + " (" + view_df["weight"].map(lambda x: f"{float(x):.2f}") + ")"
         view_df = view_df[["territory_id", "territory", "rep_id", "rep_name", "am_id", "am_name"]]
@@ -664,38 +662,37 @@ else:
         st.divider()
 
         # KPIs
+        alloc_df = st.session_state["assign_df"].copy()
+
         kpi_rep = (
-            st.session_state["assign_df"]
-            .assign(rep_id=lambda d: d["rep_id"].astype(str).str.strip())
+            alloc_df.assign(rep_id=lambda d: d["rep_id"].astype(str).str.strip())
             .query("rep_id != ''")
             .groupby(["rep_id", "rep_name"], as_index=False)
             .agg(territories=("territory_id", "count"), weight=("weight", "sum"))
             .sort_values(["weight"], ascending=False)
         )
         kpi_am = (
-            st.session_state["assign_df"]
-            .assign(am_id=lambda d: d["am_id"].astype(str).str.strip())
+            alloc_df.assign(am_id=lambda d: d["am_id"].astype(str).str.strip())
             .query("am_id != ''")
             .groupby(["am_id", "am_name"], as_index=False)
             .agg(territories=("territory_id", "count"), weight=("weight", "sum"))
             .sort_values(["weight"], ascending=False)
         )
 
-        unassigned = st.session_state["assign_df"][st.session_state["assign_df"]["rep_id"].astype(str).str.strip() == ""]
-        st.warning(f"Unassigned territories to REP: {len(unassigned)} | total weight={unassigned['weight'].sum():.2f}")
+        unassigned = alloc_df[alloc_df["rep_id"].astype(str).str.strip() == ""]
+        st.warning(f"Unassigned to REP: {len(unassigned)} | total weight={unassigned['weight'].sum():.2f}")
 
         st.write("#### REP KPI")
         st.dataframe(kpi_rep, use_container_width=True, hide_index=True)
         st.write("#### AM KPI")
         st.dataframe(kpi_am, use_container_width=True, hide_index=True)
 
-
 st.divider()
 
 
-# -----------------------------
+# ============================================================
 # Export
-# -----------------------------
+# ============================================================
 st.subheader("3) Export")
 
 assign_df = st.session_state["assign_df"].copy()
@@ -750,7 +747,6 @@ else:
             mime="text/csv",
         )
 
-        # XLSX (if openpyxl exists)
         try:
             xlsx_bytes = df_to_xlsx_bytes(
                 {"Allocations": alloc_df, "REP_Summary": sum_rep, "AM_Summary": sum_am}
@@ -764,8 +760,8 @@ else:
         except Exception:
             st.warning("XLSX disabled (missing openpyxl). Use CSV.")
 
-st.write("**Map HTML export** (includes admin units colored by REP + REP/AM pins)")
-m = make_map(show_admin_layer=True, show_assigned_colors=True)
+st.write("**Map HTML export** (admin + colored assignments + anonymous pins)")
+m = make_map()
 html_bytes = save_map_html(m)
 st.download_button(
     "Download map.html",
