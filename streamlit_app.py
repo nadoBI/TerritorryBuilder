@@ -251,6 +251,8 @@ def make_map() -> folium.Map:
         return m
 
     admin_geojson = cached_admin_geojson(st.session_state["admin_geojson"])
+    rep_layer = folium.FeatureGroup(name="REPs", show=True)
+    am_layer  = folium.FeatureGroup(name="AMs", show=False)  # di default spento
 
     selected_now = set(st.session_state.get("selected_admin_ids", []))
     admin_to_terr_idx = _build_admin_to_territory_index(st.session_state["project"])
