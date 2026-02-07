@@ -1,3 +1,4 @@
 email,password,active
-user1@company.com,pass123,true
+A,A,true
+
 user2@company.com,pass123,false
