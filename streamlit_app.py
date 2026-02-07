@@ -114,14 +114,7 @@ with colC:
         file_name="fieldforce_template.csv",
         disabled=not Path("data/templates/fieldforce_template.csv").exists(),
     )
-    st.download_button(
-        "Download weights template",
-        data=Path("data/templates/weights_template.csv").read_bytes()
-        if Path("data/templates/weights_template.csv").exists()
-        else b"",
-        file_name="weights_template.csv",
-        disabled=not Path("data/templates/weights_template.csv").exists(),
-    )
+
 
 st.divider()
 
